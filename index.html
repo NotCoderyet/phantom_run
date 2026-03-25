@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>PHANTOM RUN</title>
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css"/>
+
+  <!-- p5.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+
+  <!--
+    MediaPipe Tasks Vision — loaded as an ES module so it can import from CDN.
+    We pull out the two classes we need and put them on window._MPVision,
+    then fire the "mp-ready" event so gesture.js knows it can proceed.
+  -->
+  <script type="module">
+    import {
+      HandLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.12/+esm";
+
+    window._MPVision = { HandLandmarker, FilesetResolver };
+    window._MPReady  = true;
+    window.dispatchEvent(new Event("mp-ready"));
+  </script>
+</head>
+<body>
+
+  <!-- Hidden raw webcam feed — used as source for MediaPipe -->
+  <video id="webcam" autoplay playsinline muted></video>
+
+  <!-- p5 canvas lives here -->
+  <div id="canvas-container"></div>
+
+  <!-- ── Debug HUD (toggle with D key) ──────────────────── -->
+  <div id="debug-hud" class="debug-hud">
+    <div class="dh-title">// DEBUG  <button id="debug-toggle" class="dh-btn">HIDE</button></div>
+    <div class="dh-row"><span class="dh-lbl">GESTURE</span> <span id="d-gesture">—</span></div>
+    <div class="dh-row"><span class="dh-lbl">HAND</span>    <span id="d-hand">—</span></div>
+    <div class="dh-row"><span class="dh-lbl">VX / VY</span> <span id="d-vxy">—</span></div>
+    <div class="dh-row"><span class="dh-lbl">PALM %</span>  <span id="d-palm">—</span></div>
+    <div class="dh-row"><span class="dh-lbl">FPS</span>     <span id="d-fps">—</span></div>
+    <div class="dh-row"><span class="dh-lbl">STATE</span>   <span id="d-state">—</span></div>
+    <div class="dh-row"><span class="dh-lbl">SPEED</span>   <span id="d-speed">—</span></div>
+  </div>
+
+  <!-- ── Webcam corner preview (toggle with V key) ──────── -->
+  <div id="cam-preview-wrap">
+    <canvas id="cam-canvas" width="200" height="112"></canvas>
+    <div class="cam-footer">
+      ✋ CAM
+      <button id="cam-toggle" class="cam-btn">[V]</button>
+    </div>
+  </div>
+
+  <!-- Scripts: gesture engine → game logic → p5 sketch -->
+  <script src="gesture.js"></script>
+  <script src="game.js"></script>
+  <script src="sketch.js"></script>
+</body>
+</html>
