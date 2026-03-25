@@ -252,7 +252,9 @@ window.Game = (function () {
         break;
       case "PAUSE":
         if (gameState === "playing") { gameState = "paused"; }
-        else if (gameState === "paused") { gameState = "playing"; }
+        break;
+      case "RESUME":
+        if (gameState === "paused") { gameState = "playing"; }
         break;
     }
   }
