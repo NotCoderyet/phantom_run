@@ -1,56 +1,82 @@
 /* ============================================================
    gesture.js — MediaPipe Hand Tracking + Gesture Detection
    ============================================================
-   GESTURE MAPPINGS:
+   Exposes: window.GestureEngine  (singleton)
+
+   NEW GESTURE MAPPINGS:
      JUMP    — swipe ONE hand upward quickly
      DUCK    — swipe ONE hand downward quickly
      DASH    — swipe ONE hand to the right quickly
-     START   — hold ONE open palm for ~800ms (title/dead screen)
-     PAUSE   — show TWO open palms at same time
-     RESUME  — show TWO closed fists at same time
+     START   — hold ONE open palm for PALM_HOLD_MS ms (title/dead screen)
+     PAUSE   — show TWO open palms at same time (while playing)
+     RESUME  — show TWO closed fists at same time (while paused)
+
+   WHY THIS IS MORE RELIABLE:
+     - Pause/resume are now two-handed, impossible to trigger accidentally
+     - Jump/duck are pure motion — not shape-based, so hand shape doesn't matter
+     - Fist detection on one hand is completely removed (was causing random pauses)
 */
 "use strict";
 
+// ── Tuning constants ──────────────────────────────────────────────────────────
+// TODO: raise SWIPE thresholds if gestures trigger too easily
+// TODO: lower them if you have to swipe very hard
 const GCFG = {
-  HISTORY_LENGTH:        16,
-  SWIPE_UP_THRESHOLD:    0.028,
-  SWIPE_DOWN_THRESHOLD:  0.026,
-  DASH_THRESHOLD:        0.032,
-  COOLDOWN_JUMP:         600,
-  COOLDOWN_DUCK:         380,
-  COOLDOWN_DASH:         320,
-  PALM_HOLD_MS:          800,
-  TWO_PALM_FRAMES:       10,
-  TWO_FIST_FRAMES:       10,
-  SMOOTH_FRAMES:         4,
-  OPEN_PALM_SPREAD:      0.16,
-  FIST_THRESHOLD:        0.10,
-  MIN_CONFIDENCE:        0.50,
+  HISTORY_LENGTH:        16,    // frames of landmark history kept per hand
+  SWIPE_UP_THRESHOLD:    0.028, // normalised dy — how fast wrist must move UP to jump
+  SWIPE_DOWN_THRESHOLD:  0.026, // normalised dy — how fast wrist must move DOWN to duck
+  DASH_THRESHOLD:        0.032, // normalised dx — how fast wrist must move RIGHT to dash
+  COOLDOWN_JUMP:         600,   // ms — minimum time between jumps
+  COOLDOWN_DUCK:         380,   // ms — minimum time between ducks
+  COOLDOWN_DASH:         320,   // ms — minimum time between dashes
+  PALM_HOLD_MS:          800,   // ms — how long to hold one palm to start/restart
+  TWO_PALM_FRAMES:       10,    // consecutive frames both hands must be open to pause
+  TWO_FIST_FRAMES:       10,    // consecutive frames both hands must be fists to resume
+  SMOOTH_FRAMES:         4,     // frames averaged for velocity (more = smoother but laggier)
+  OPEN_PALM_SPREAD:      0.16,  // avg fingertip-to-palm dist — above this = open palm
+  FIST_THRESHOLD:        0.10,  // avg fingertip-to-palm dist — below this = fist
+  MIN_CONFIDENCE:        0.50,  // MediaPipe detection confidence floor
 };
 
+// ── GestureEngine singleton ───────────────────────────────────────────────────
 window.GestureEngine = (function () {
 
+  // MediaPipe
   let handLandmarker = null;
   let ready          = false;
   let lastVideoTime  = -1;
-  let histories      = [[], []];
-  let lastJump = 0, lastDuck = 0, lastDash = 0;
-  let palmHoldStart = null, palmHoldFired = false;
-  let twoPalmFrames = 0, twoFistFrames = 0;
-  let twoPalmFired  = false, twoFistFired = false;
-  let _lastLMs      = [];
 
+  // Per-hand landmark history (index 0 = first detected hand, index 1 = second)
+  let histories = [[], []];
+
+  // Cooldown timestamps for motion gestures (one hand only needed)
+  let lastJump = 0, lastDuck = 0, lastDash = 0;
+
+  // Single-palm hold (for START on title/dead screen)
+  let palmHoldStart = null, palmHoldFired = false;
+
+  // Two-hand shape hold counters
+  let twoPalmFrames = 0;   // both hands open
+  let twoFistFrames = 0;   // both hands fist
+  let twoPalmFired  = false;
+  let twoFistFired  = false;
+
+  // Most recent raw landmarks for both hands (for preview drawing)
+  let _lastLMs = [];
+
+  // ── Public state (read by sketch.js every frame) ──────────────────────────
   const state = {
     gesture:      "none",
-    handPresent:  false,
-    handsCount:   0,
-    openPalm:     false,
-    closedFist:   false,
-    pending:      [],
-    palmProgress: 0,
+    handPresent:  false,      // at least 1 hand visible
+    handsCount:   0,          // 0, 1, or 2
+    openPalm:     false,      // primary hand is open palm
+    closedFist:   false,      // primary hand is fist
+    pending:      [],         // gesture strings to consume this frame
+    palmProgress: 0,          // 0-1 fill for the START ring UI
     debugInfo:    { vx: "0", vy: "0", hands: 0, shape0: "—", shape1: "—" },
   };
 
+  // ── init: load MediaPipe model ────────────────────────────────────────────
   async function init(videoEl) {
     await _waitForMP();
     const { HandLandmarker, FilesetResolver } = window._MPVision;
@@ -66,7 +92,7 @@ window.GestureEngine = (function () {
         delegate,
       },
       runningMode:                 "VIDEO",
-      numHands:                    2,
+      numHands:                    2,        // ← track up to 2 hands
       minHandDetectionConfidence:  GCFG.MIN_CONFIDENCE,
       minHandPresenceConfidence:   GCFG.MIN_CONFIDENCE,
       minTrackingConfidence:       GCFG.MIN_CONFIDENCE,
@@ -90,6 +116,7 @@ window.GestureEngine = (function () {
     });
   }
 
+  // ── processFrame: called every p5 draw tick ───────────────────────────────
   function processFrame(videoEl) {
     state.pending = [];
     if (!ready || !videoEl || videoEl.readyState < 2) return;
@@ -102,43 +129,78 @@ window.GestureEngine = (function () {
     } catch (e) { return; }
 
     const count   = result.landmarks ? result.landmarks.length : 0;
-    _lastLMs      = result.landmarks || [];
-    state.handsCount  = count;
-    state.handPresent = count > 0;
+    _lastLMs      = [];
+    let validCount = 0;
 
-    if (count === 0) { _resetAll(); return; }
+    // Filter out false detections (face detected as hand)
+    // Real hands: wrist landmark is usually in lower 70% of frame
+    // Face detections: tend to be centered and high in frame
+    for (let i = 0; i < count; i++) {
+      const lm = result.landmarks[i];
+      const wristY = lm[0].y; // normalised 0-1, 0=top
+      const wristX = lm[0].x;
+      // Reject if wrist is in top 20% of frame (likely face)
+      if (wristY < 0.20) continue;
+      // Reject if all landmarks are tightly clustered in center (face blob)
+      const spread = lm.reduce((s,p) => s + Math.abs(p.x - wristX) + Math.abs(p.y - wristY), 0) / lm.length;
+      if (spread < 0.015) continue;
+      _lastLMs.push(lm);
+      validCount++;
+      if (validCount >= 2) break; // max 2 hands
+    }
 
-    const now    = performance.now();
+    state.handsCount  = validCount;
+    state.handPresent = validCount > 0;
+
+    // Reset if no valid hands at all
+    if (validCount === 0) {
+      _resetAll();
+      return;
+    }
+
+    const now = performance.now();
+
+    // ── Process each detected hand ────────────────────────────────────────
     const shapes = [];
+    for (let hi = 0; hi < Math.min(validCount, 2); hi++) {
+      const lm = _lastLMs[hi];
 
-    for (let hi = 0; hi < Math.min(count, 2); hi++) {
-      const lm = result.landmarks[hi];
+      // Build history entry for this hand
       histories[hi].push({
         wrist:      { x: lm[0].x, y: lm[0].y },
         palmCenter: { x: lm[9].x, y: lm[9].y },
         tips:       [lm[4], lm[8], lm[12], lm[16], lm[20]],
       });
       if (histories[hi].length > GCFG.HISTORY_LENGTH) histories[hi].shift();
+
       shapes.push(_classifyShape(hi));
     }
 
-    if (count < 2) histories[1] = [];
+    // If second hand disappeared, clear its history
+    if (validCount < 2) {
+      histories[1] = [];
+    }
 
+    // Primary hand (index 0) shape and motion
     const primaryShape  = shapes[0] || "neutral";
     const primaryMotion = _classifyMotion(0);
-    const secondShape   = shapes[1] || "none";
+    const secondShape   = shapes[1] || "none"; // "none" if only 1 hand
 
     state.openPalm   = primaryShape === "open_palm";
     state.closedFist = primaryShape === "fist";
     state.gesture    = primaryMotion !== "none" ? primaryMotion : primaryShape;
     state.debugInfo  = {
-      vx: state.debugInfo.vx, vy: state.debugInfo.vy,
-      hands: count, shape0: primaryShape, shape1: secondShape,
+      vx:     state.debugInfo.vx,
+      vy:     state.debugInfo.vy,
+      hands:  count,
+      shape0: primaryShape,
+      shape1: secondShape,
     };
 
     _fireGestures(primaryShape, primaryMotion, secondShape, now);
   }
 
+  // ── Shape classification for one hand ────────────────────────────────────
   function _classifyShape(handIndex) {
     const h = histories[handIndex];
     if (!h || !h.length) return "unknown";
@@ -147,22 +209,29 @@ window.GestureEngine = (function () {
     const avg = f.tips.reduce(
       (sum, t) => sum + Math.hypot(t.x - pc.x, t.y - pc.y), 0
     ) / f.tips.length;
+
     if (avg > GCFG.OPEN_PALM_SPREAD) return "open_palm";
     if (avg < GCFG.FIST_THRESHOLD)   return "fist";
     return "neutral";
   }
 
+  // ── Motion classification (swipe) for one hand ───────────────────────────
   function _classifyMotion(handIndex) {
     const h = histories[handIndex];
     if (!h) return "none";
     const n = h.length;
     if (n < GCFG.SMOOTH_FRAMES + 3) return "none";
+
     const recent = _avgWrist(h, n - GCFG.SMOOTH_FRAMES,     n);
     const older  = _avgWrist(h, n - GCFG.SMOOTH_FRAMES - 3, n - GCFG.SMOOTH_FRAMES);
-    const vy = older.y - recent.y;
-    const vx = recent.x - older.x;
+
+    // y increases downward in normalised coords
+    const vy = older.y - recent.y; // positive = moved UP
+    const vx = recent.x - older.x; // positive = moved RIGHT
+
     state.debugInfo.vy = vy.toFixed(3);
     state.debugInfo.vx = vx.toFixed(3);
+
     if ( vy >  GCFG.SWIPE_UP_THRESHOLD)   return "swipe_up";
     if (-vy >  GCFG.SWIPE_DOWN_THRESHOLD) return "swipe_down";
     if ( vx >  GCFG.DASH_THRESHOLD)       return "swipe_right";
@@ -178,87 +247,119 @@ window.GestureEngine = (function () {
     };
   }
 
+  // ── Gesture firing ────────────────────────────────────────────────────────
   function _fireGestures(primaryShape, primaryMotion, secondShape, now) {
 
-    // JUMP
+    // ── JUMP — swipe up with one hand ──────────────────────────────────────
     if (primaryMotion === "swipe_up" && now - lastJump > GCFG.COOLDOWN_JUMP) {
-      lastJump = now; _push("JUMP");
-    }
-    // DUCK
-    if (primaryMotion === "swipe_down" && now - lastDuck > GCFG.COOLDOWN_DUCK) {
-      lastDuck = now; _push("DUCK");
-    }
-    // DASH
-    if (primaryMotion === "swipe_right" && now - lastDash > GCFG.COOLDOWN_DASH) {
-      lastDash = now; _push("DASH");
+      lastJump = now;
+      _push("JUMP");
     }
 
-    // START — one open palm held (only when 1 hand visible)
+    // ── DUCK — swipe down with one hand ───────────────────────────────────
+    if (primaryMotion === "swipe_down" && now - lastDuck > GCFG.COOLDOWN_DUCK) {
+      lastDuck = now;
+      _push("DUCK");
+    }
+
+    // ── DASH — swipe right with one hand ──────────────────────────────────
+    if (primaryMotion === "swipe_right" && now - lastDash > GCFG.COOLDOWN_DASH) {
+      lastDash = now;
+      _push("DASH");
+    }
+
+    // ── START — hold ONE open palm on title / dead screen ─────────────────
+    // Only fires if there is exactly 1 hand (avoids conflict with 2-palm pause)
     if (state.handsCount === 1 && primaryShape === "open_palm") {
       if (!palmHoldStart) palmHoldStart = now;
       state.palmProgress = Math.min(1, (now - palmHoldStart) / GCFG.PALM_HOLD_MS);
       if (!palmHoldFired && state.palmProgress >= 1) {
-        palmHoldFired = true; _push("START");
+        palmHoldFired = true;
+        _push("START");
       }
     } else {
-      palmHoldStart = null; palmHoldFired = false; state.palmProgress = 0;
+      // Reset palm hold if hand goes away or second hand appears
+      if (state.handsCount !== 1 || primaryShape !== "open_palm") {
+        palmHoldStart  = null;
+        palmHoldFired  = false;
+        state.palmProgress = 0;
+      }
     }
 
-    // PAUSE — both hands open
+    // ── PAUSE — both hands open at same time ──────────────────────────────
     const bothOpen = state.handsCount === 2
                   && primaryShape === "open_palm"
                   && secondShape  === "open_palm";
+
     if (bothOpen) {
       twoPalmFrames++;
-      twoFistFrames = 0; twoFistFired = false;
+      twoFistFrames = 0; twoFistFired = false; // reset opposite
       if (!twoPalmFired && twoPalmFrames >= GCFG.TWO_PALM_FRAMES) {
-        twoPalmFired = true; _push("PAUSE");
+        twoPalmFired = true;
+        _push("PAUSE");
       }
     } else {
-      twoPalmFrames = 0; twoPalmFired = false;
+      twoPalmFrames = 0;
+      twoPalmFired  = false;
     }
 
-    // RESUME — both hands fist
+    // ── RESUME — both hands fist at same time ─────────────────────────────
     const bothFist = state.handsCount === 2
                   && primaryShape === "fist"
                   && secondShape  === "fist";
+
     if (bothFist) {
       twoFistFrames++;
-      twoPalmFrames = 0; twoPalmFired = false;
+      twoPalmFrames = 0; twoPalmFired = false; // reset opposite
       if (!twoFistFired && twoFistFrames >= GCFG.TWO_FIST_FRAMES) {
-        twoFistFired = true; _push("RESUME");
+        twoFistFired = true;
+        _push("RESUME");
       }
     } else {
-      twoFistFrames = 0; twoFistFired = false;
+      twoFistFrames = 0;
+      twoFistFired  = false;
     }
   }
 
-  function _push(name) { state.gesture = name; state.pending.push(name); }
+  function _push(name) {
+    state.gesture = name;
+    state.pending.push(name);
+  }
 
   function _resetAll() {
-    histories = [[], []]; _lastLMs = [];
-    state.gesture = "none"; state.openPalm = false; state.closedFist = false;
+    histories      = [[], []];
+    _lastLMs       = [];
+    state.gesture  = "none";
+    state.openPalm = false;
+    state.closedFist = false;
     state.palmProgress = 0;
-    palmHoldStart = null; palmHoldFired = false;
-    twoPalmFrames = 0; twoPalmFired = false;
-    twoFistFrames = 0; twoFistFired = false;
+    palmHoldStart  = null; palmHoldFired = false;
+    twoPalmFrames  = 0;   twoPalmFired  = false;
+    twoFistFrames  = 0;   twoFistFired  = false;
     state.debugInfo = { vx: "0", vy: "0", hands: 0, shape0: "—", shape1: "—" };
   }
 
+  // ── Webcam preview landmark drawing ──────────────────────────────────────
   function drawLandmarksOnCanvas(ctx, w, h) {
     const CONNS = [
-      [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
-      [5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],
-      [13,17],[17,18],[18,19],[19,20],[0,17],
+      [0,1],[1,2],[2,3],[3,4],
+      [0,5],[5,6],[6,7],[7,8],
+      [5,9],[9,10],[10,11],[11,12],
+      [9,13],[13,14],[14,15],[15,16],
+      [13,17],[17,18],[18,19],[19,20],
+      [0,17],
     ];
-    const LINE_COLS = ["rgba(230,255,80,0.8)",  "rgba(80,220,255,0.8)"];
-    const DOT_COLS  = ["rgba(255,80,120,0.95)", "rgba(80,180,255,0.95)"];
+
+    // Draw each detected hand in a different colour
+    const COLOURS = ["rgba(230,255,80,0.8)", "rgba(80,220,255,0.8)"];
+    const DOT_COLS = ["rgba(255,80,120,0.95)", "rgba(80,180,255,0.95)"];
 
     _lastLMs.forEach((lm, hi) => {
       if (!lm) return;
       const mx = v => (1 - v.x) * w;
       const my = v => v.y * h;
-      ctx.strokeStyle = LINE_COLS[hi] || LINE_COLS[0];
+
+      ctx.strokeStyle = COLOURS[hi] || COLOURS[0];
       ctx.lineWidth   = 1.5;
       for (const [a, b] of CONNS) {
         if (!lm[a] || !lm[b]) continue;
@@ -267,43 +368,50 @@ window.GestureEngine = (function () {
         ctx.lineTo(mx(lm[b]), my(lm[b]));
         ctx.stroke();
       }
-      ctx.fillStyle = DOT_COLS[hi] || DOT_COLS[0];
+      const dc = DOT_COLS[hi] || DOT_COLS[0];
       for (const i of [4, 8, 12, 16, 20]) {
         if (!lm[i]) continue;
+        ctx.fillStyle = dc;
         ctx.beginPath();
         ctx.arc(mx(lm[i]), my(lm[i]), 3.5, 0, Math.PI * 2);
         ctx.fill();
       }
     });
 
-    // One-palm start progress ring
+    // Palm-hold start ring (only when 1 hand showing)
     if (state.palmProgress > 0 && state.handsCount === 1) {
       ctx.strokeStyle = "rgba(80,255,180,0.9)";
       ctx.lineWidth   = 4;
       ctx.beginPath();
-      ctx.arc(w/2, h/2, 22, -Math.PI/2, -Math.PI/2 + Math.PI*2*state.palmProgress);
+      ctx.arc(w / 2, h / 2, 22, -Math.PI / 2,
+              -Math.PI / 2 + Math.PI * 2 * state.palmProgress);
       ctx.stroke();
     }
-    // Two-palm pause progress ring
+
+    // Two-palm pause progress indicator
     if (twoPalmFrames > 0 && state.handsCount === 2) {
+      const prog = twoPalmFrames / GCFG.TWO_PALM_FRAMES;
       ctx.strokeStyle = "rgba(255,180,80,0.9)";
       ctx.lineWidth   = 4;
       ctx.beginPath();
-      ctx.arc(w/2, h/2, 22, -Math.PI/2,
-              -Math.PI/2 + Math.PI*2*Math.min(twoPalmFrames/GCFG.TWO_PALM_FRAMES, 1));
+      ctx.arc(w / 2, h / 2, 22, -Math.PI / 2,
+              -Math.PI / 2 + Math.PI * 2 * Math.min(prog, 1));
       ctx.stroke();
     }
-    // Two-fist resume progress ring
+
+    // Two-fist resume progress indicator
     if (twoFistFrames > 0 && state.handsCount === 2) {
+      const prog = twoFistFrames / GCFG.TWO_FIST_FRAMES;
       ctx.strokeStyle = "rgba(80,180,255,0.9)";
       ctx.lineWidth   = 4;
       ctx.beginPath();
-      ctx.arc(w/2, h/2, 22, -Math.PI/2,
-              -Math.PI/2 + Math.PI*2*Math.min(twoFistFrames/GCFG.TWO_FIST_FRAMES, 1));
+      ctx.arc(w / 2, h / 2, 22, -Math.PI / 2,
+              -Math.PI / 2 + Math.PI * 2 * Math.min(prog, 1));
       ctx.stroke();
     }
   }
 
+  // getLastLM still returns first hand for backward compat
   function getLastLM() { return _lastLMs[0] || null; }
 
   return { init, processFrame, drawLandmarksOnCanvas, getLastLM, state };
